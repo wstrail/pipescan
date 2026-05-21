@@ -78,7 +78,13 @@ uvicorn main:app --reload --host 0.0.0.0 --port 8000
 后端启动时会自动创建数据库表：
 
 - `pipe_segments`
+- `inspection_records`
 - `inspection_reports`
+
+其中：
+
+- `inspection_records` 保存用户填写的原始检测数据。
+- `inspection_reports` 保存生成后的报告、评估结果和报告文件路径。
 
 ## 5. 检查后端是否连上数据库
 
@@ -166,4 +172,3 @@ docker compose down -v
 ```
 
 这个命令会删除数据库数据卷，所有管道数据和报告记录都会丢失。
-

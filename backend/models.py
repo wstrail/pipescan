@@ -34,6 +34,27 @@ class PipeSegment(Base):
         back_populates="pipe",
         cascade="all, delete-orphan",
     )
+    inspections: Mapped[list["InspectionRecord"]] = relationship(
+        back_populates="pipe",
+        cascade="all, delete-orphan",
+    )
+
+
+class InspectionRecord(Base):
+    __tablename__ = "inspection_records"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    pipe_id: Mapped[int] = mapped_column(ForeignKey("pipe_segments.id"), nullable=False, index=True)
+    input_data: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    defects: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
+
+    pipe: Mapped[PipeSegment] = relationship(back_populates="inspections")
+    report: Mapped["InspectionReport"] = relationship(
+        back_populates="inspection",
+        cascade="all, delete-orphan",
+        uselist=False,
+    )
 
 
 class InspectionReport(Base):
@@ -41,10 +62,11 @@ class InspectionReport(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
     pipe_id: Mapped[int] = mapped_column(ForeignKey("pipe_segments.id"), nullable=False, index=True)
-    payload: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    inspection_id: Mapped[int] = mapped_column(ForeignKey("inspection_records.id"), nullable=False, index=True)
     evaluation: Mapped[dict] = mapped_column(JSONB, nullable=False)
     markdown: Mapped[str] = mapped_column(Text, nullable=False)
     report_path: Mapped[str] = mapped_column(String(500), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
 
     pipe: Mapped[PipeSegment] = relationship(back_populates="reports")
+    inspection: Mapped[InspectionRecord] = relationship(back_populates="report")

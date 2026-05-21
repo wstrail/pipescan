@@ -6,7 +6,7 @@ const API_BASE = import.meta.env.VITE_API_BASE || 'http://localhost:8000'
 const robot = ref({
   connected: false,
   mode: 'standby',
-  speed: 0,
+  speed: 0.35,
   battery_percent: 0,
   distance_m: 0,
   last_command: 'none',
@@ -24,6 +24,15 @@ const busy = ref(false)
 const error = ref('')
 const reportMarkdown = ref('')
 const evaluation = ref(null)
+const telemetry = ref({
+  temperature_c: 32.6,
+  humidity_percent: 68,
+  pressure_kpa: 101.2,
+  pitch_deg: 1.8,
+  roll_deg: -0.6,
+  signal_percent: 92,
+  flow_status: 'normal'
+})
 
 const inspection = ref({
   pipe_id: 'P-001',
@@ -38,11 +47,26 @@ const inspection = ref({
 })
 
 const riskText = computed(() => {
-  if (!evaluation.value) return '待评估'
+  if (!evaluation.value) return '等待评估'
   const repair = evaluation.value.levels.repair_level
   const maintenance = evaluation.value.levels.maintenance_level
   return `${repair.level} ${repair.status} / ${maintenance.level} ${maintenance.status}`
 })
+
+const directionText = computed(() => {
+  const map = {
+    forward: '前进',
+    backward: '后退',
+    left: '左转',
+    right: '右转',
+    stop: '停止',
+    set_speed: '调速',
+    none: '待命'
+  }
+  return map[robot.value.last_command] || '待命'
+})
+
+const defectCount = computed(() => inspection.value.defects.length)
 
 const renderedReportHtml = computed(() => renderMarkdown(reportMarkdown.value))
 
@@ -59,6 +83,15 @@ function renderInline(value) {
   return escapeHtml(value)
     .replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>')
     .replace(/`([^`]+)`/g, '<code>$1</code>')
+}
+
+function splitTableRow(row) {
+  return row
+    .trim()
+    .replace(/^\|/, '')
+    .replace(/\|$/, '')
+    .split('|')
+    .map((cell) => cell.trim())
 }
 
 function renderMarkdown(markdown) {
@@ -87,27 +120,15 @@ function renderMarkdown(markdown) {
     tableRows = []
   }
 
-  function splitTableRow(row) {
-    return row
-      .trim()
-      .replace(/^\|/, '')
-      .replace(/\|$/, '')
-      .split('|')
-      .map((cell) => cell.trim())
-  }
-
   for (const line of lines) {
     const trimmed = line.trim()
-    const isTableLine = trimmed.startsWith('|') && trimmed.endsWith('|')
-
-    if (isTableLine) {
+    if (trimmed.startsWith('|') && trimmed.endsWith('|')) {
       flushList()
       tableRows.push(trimmed)
       continue
     }
 
     flushTable()
-
     if (!trimmed) {
       flushList()
       continue
@@ -173,7 +194,7 @@ async function sendMotion(action) {
   try {
     robot.value = await request('/api/robot/motion', {
       method: 'POST',
-      body: JSON.stringify({ action, speed: Number(robot.value.speed || 0.3), duration_ms: 300 })
+      body: JSON.stringify({ action, speed: Number(robot.value.speed || 0.35), duration_ms: 300 })
     })
   } catch (err) {
     error.value = err.message
@@ -247,65 +268,120 @@ onMounted(loadStatus)
 </script>
 
 <template>
-  <main class="shell">
-    <header class="topbar">
+  <main class="camera-shell">
+    <header class="app-header">
       <div>
-        <h1>PipeScan 管道机器人控制面板</h1>
-        <p>运动控制、摄像头接入、缺陷评估与报告生成</p>
+        <p class="eyebrow">PipeScan Live Console</p>
+        <h1>管道机器人摄像控制台</h1>
       </div>
-      <button class="primary" :disabled="busy" @click="connectRobot">连接机器人</button>
+      <div class="header-actions">
+        <span :class="['signal', robot.connected ? 'online' : 'offline']">
+          {{ robot.connected ? 'ONLINE' : 'OFFLINE' }}
+        </span>
+        <button class="primary" :disabled="busy" @click="connectRobot">连接机器人</button>
+      </div>
     </header>
 
     <p v-if="error" class="error">{{ error }}</p>
 
-    <section class="dashboard">
-      <div class="panel status-panel">
-        <h2>设备状态</h2>
-        <div class="metrics">
-          <div><span>连接</span><strong>{{ robot.connected ? '在线' : '离线' }}</strong></div>
-          <div><span>模式</span><strong>{{ robot.mode }}</strong></div>
-          <div><span>电量</span><strong>{{ robot.battery_percent }}%</strong></div>
-          <div><span>里程</span><strong>{{ robot.distance_m }} m</strong></div>
-        </div>
-        <label>
-          速度
-          <input v-model.number="robot.speed" type="range" min="0" max="1" step="0.05" />
-        </label>
-      </div>
+    <section class="operator-layout">
+      <section class="viewfinder-panel">
+        <div class="camera-body">
+          <div class="viewfinder">
+            <div class="hud hud-top">
+              <div class="hud-group">
+                <strong>{{ directionText }}</strong>
+                <span>[ {{ inspection.pipe_id }} ]</span>
+                <span>里程 {{ robot.distance_m }} m</span>
+              </div>
+              <div class="hud-group right">
+                <span>电量 {{ robot.battery_percent }}%</span>
+                <span>{{ camera.enabled ? '摄像在线' : '摄像关闭' }}</span>
+              </div>
+            </div>
 
-      <div class="panel control-panel">
-        <h2>运动控制</h2>
-        <div class="dpad">
-          <button @click="sendMotion('forward')">↑</button>
-          <button @click="sendMotion('left')">←</button>
-          <button class="stop" @click="sendMotion('stop')">■</button>
-          <button @click="sendMotion('right')">→</button>
-          <button @click="sendMotion('backward')">↓</button>
-        </div>
-        <p>最后指令：{{ robot.last_command }} · {{ robot.updated_at }}</p>
-      </div>
+            <div class="hud hud-left">
+              <span>方向 {{ directionText }}</span>
+              <span>速度 {{ Number(robot.speed || 0).toFixed(2) }}</span>
+              <span>管径 {{ inspection.diameter_mm }}mm</span>
+              <span>长度 {{ inspection.pipe_length }}m</span>
+              <span>缺陷 {{ defectCount }}处</span>
+            </div>
 
-      <div class="panel camera-panel">
-        <h2>摄像头接口</h2>
-        <div class="camera-view">
-          <div>
-            <strong>{{ camera.enabled ? '视频已启用' : '视频已关闭' }}</strong>
-            <span>{{ camera.resolution }}</span>
-            <small>{{ snapshot?.captured_at || '等待帧数据' }}</small>
+            <div class="hud hud-right">
+              <span>温度 {{ telemetry.temperature_c }}°C</span>
+              <span>湿度 {{ telemetry.humidity_percent }}%</span>
+              <span>压力 {{ telemetry.pressure_kpa }}kPa</span>
+              <span>姿态 P{{ telemetry.pitch_deg }}° R{{ telemetry.roll_deg }}°</span>
+              <span>信号 {{ telemetry.signal_percent }}%</span>
+            </div>
+
+            <div class="camera-feed">
+              <div class="video-placeholder">
+                <strong>{{ camera.enabled ? '视频已启用' : '视频已关闭' }}</strong>
+                <span>{{ camera.resolution }}</span>
+                <small>{{ snapshot?.captured_at || '等待帧数据' }}</small>
+              </div>
+            </div>
+
+            <div class="hud hud-bottom">
+              <div class="exposure-card">当前动作 {{ directionText }}</div>
+              <div class="exposure-card distance-card">当前距离 {{ robot.distance_m }} m</div>
+              <div class="exposure-card">风险 {{ riskText }}</div>
+            </div>
           </div>
         </div>
-        <div class="form-grid">
+
+        <div class="camera-settings">
           <label>视频源<input v-model="camera.source" /></label>
           <label>分辨率<input v-model="camera.resolution" /></label>
-          <label class="check"><input v-model="camera.enabled" type="checkbox" /> 启用</label>
+          <label class="check"><input v-model="camera.enabled" type="checkbox" /> 启用摄像头</label>
+          <button @click="saveCamera">保存摄像头配置</button>
         </div>
-        <button @click="saveCamera">保存摄像头配置</button>
-      </div>
+      </section>
+
+      <aside class="side-stack">
+        <section class="panel control-panel">
+          <h2>运动控制</h2>
+          <div class="control-layout">
+            <div>
+              <div class="status-grid">
+                <div><span>模式</span><strong>{{ robot.mode }}</strong></div>
+                <div><span>电量</span><strong>{{ robot.battery_percent }}%</strong></div>
+                <div><span>里程</span><strong>{{ robot.distance_m }}m</strong></div>
+                <div><span>指令</span><strong>{{ robot.last_command }}</strong></div>
+              </div>
+              <label class="speed-control">
+                速度
+                <input v-model.number="robot.speed" type="range" min="0" max="1" step="0.05" />
+              </label>
+            </div>
+            <div class="dpad">
+              <button @click="sendMotion('forward')">↑</button>
+              <button @click="sendMotion('left')">←</button>
+              <button class="stop" @click="sendMotion('stop')">■</button>
+              <button @click="sendMotion('right')">→</button>
+              <button @click="sendMotion('backward')">↓</button>
+            </div>
+          </div>
+        </section>
+      </aside>
     </section>
 
-    <section class="workspace">
-      <div class="panel inspection-panel">
-        <h2>检测数据</h2>
+    <section class="workbench">
+      <section class="panel inspection-panel">
+        <div class="section-title">
+          <div>
+            <p class="panel-kicker">Inspection Input</p>
+            <h2>检测数据</h2>
+          </div>
+          <div class="actions">
+            <button @click="addDefect">新增缺陷</button>
+            <button @click="evaluateOnly">计算风险</button>
+            <button class="primary" @click="generateReport">生成报告</button>
+          </div>
+        </div>
+
         <div class="form-grid">
           <label>管段编号<input v-model="inspection.pipe_id" /></label>
           <label>长度(m)<input v-model.number="inspection.pipe_length" type="number" min="1" /></label>
@@ -361,20 +437,25 @@ onMounted(loadStatus)
             </tbody>
           </table>
         </div>
+      </section>
 
-        <div class="actions">
-          <button @click="addDefect">新增缺陷</button>
-          <button @click="evaluateOnly">计算风险</button>
-          <button class="primary" @click="generateReport">生成报告</button>
+      <section class="panel result-panel">
+        <div class="section-title">
+          <div>
+            <p class="panel-kicker">Assessment Report</p>
+            <h2>评估与报告</h2>
+          </div>
         </div>
-      </div>
-
-      <aside class="panel result-panel">
-        <h2>评估结果</h2>
         <div class="risk">{{ riskText }}</div>
-        <pre v-if="evaluation">{{ JSON.stringify(evaluation.parameters, null, 2) }}</pre>
-        <div v-if="reportMarkdown" class="report-preview" v-html="renderedReportHtml"></div>
-      </aside>
+        <div class="result-body">
+          <pre v-if="evaluation">{{ JSON.stringify(evaluation.parameters, null, 2) }}</pre>
+          <div v-if="reportMarkdown" class="report-preview" v-html="renderedReportHtml"></div>
+          <div v-else class="empty-report">
+            <strong>尚未生成报告</strong>
+            <span>填写检测数据后点击“生成报告”，这里会显示渲染后的报告内容。</span>
+          </div>
+        </div>
+      </section>
     </section>
   </main>
 </template>

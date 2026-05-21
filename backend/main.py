@@ -14,9 +14,12 @@ from sqlalchemy.orm import Session
 from database import get_db, init_db, ping_db
 from evaluator import Defect, PipeDefectEvaluator
 from repository import (
+    get_inspection_record,
     get_report,
+    list_inspection_records,
     list_pipe_segments,
     list_reports,
+    save_inspection_record,
     save_inspection_report,
     upsert_pipe_segment,
 )
@@ -218,10 +221,16 @@ def create_report(payload: InspectionPayload, db: Session = Depends(get_db)) -> 
             location=payload.location,
             remark=payload.remark,
         )
+        inspection = save_inspection_record(
+            db,
+            pipe=pipe,
+            input_data=payload.model_dump(),
+            defects=[item.model_dump() for item in payload.defects],
+        )
         report = save_inspection_report(
             db,
             pipe=pipe,
-            payload=payload.model_dump(),
+            inspection=inspection,
             evaluation=evaluation,
             markdown=markdown,
             report_path=str(path),
@@ -231,6 +240,7 @@ def create_report(payload: InspectionPayload, db: Session = Depends(get_db)) -> 
         raise HTTPException(status_code=503, detail=f"Database unavailable or save failed: {exc}") from exc
 
     return {
+        "inspection_id": inspection.id,
         "report_id": report.id,
         "report_path": str(path),
         "markdown": markdown,
@@ -291,6 +301,7 @@ def get_reports(limit: int = 50, db: Session = Depends(get_db)) -> list[dict]:
     return [
         {
             "id": report.id,
+            "inspection_id": report.inspection_id,
             "pipe_id": report.pipe_id,
             "pipe_code": report.pipe.pipe_code if report.pipe else "",
             "report_path": report.report_path,
@@ -314,11 +325,55 @@ def get_report_detail(report_id: int, db: Session = Depends(get_db)) -> dict:
 
     return {
         "id": report.id,
+        "inspection_id": report.inspection_id,
         "pipe_id": report.pipe_id,
         "pipe_code": report.pipe.pipe_code if report.pipe else "",
-        "payload": report.payload,
+        "input_data": report.inspection.input_data if report.inspection else {},
+        "defects": report.inspection.defects if report.inspection else [],
         "evaluation": report.evaluation,
         "markdown": report.markdown,
         "report_path": report.report_path,
         "created_at": report.created_at.isoformat(),
+    }
+
+
+@app.get("/api/inspection/records")
+def get_inspection_records(limit: int = 50, db: Session = Depends(get_db)) -> list[dict]:
+    try:
+        records = list_inspection_records(db, limit=limit)
+    except SQLAlchemyError as exc:
+        raise HTTPException(status_code=503, detail=f"Database unavailable: {exc}") from exc
+
+    return [
+        {
+            "id": record.id,
+            "pipe_id": record.pipe_id,
+            "pipe_code": record.pipe.pipe_code if record.pipe else "",
+            "input_data": record.input_data,
+            "defects": record.defects,
+            "created_at": record.created_at.isoformat(),
+            "report_id": record.report.id if record.report else None,
+        }
+        for record in records
+    ]
+
+
+@app.get("/api/inspection/records/{inspection_id}")
+def get_inspection_record_detail(inspection_id: int, db: Session = Depends(get_db)) -> dict:
+    try:
+        record = get_inspection_record(db, inspection_id)
+    except SQLAlchemyError as exc:
+        raise HTTPException(status_code=503, detail=f"Database unavailable: {exc}") from exc
+
+    if record is None:
+        raise HTTPException(status_code=404, detail="Inspection record not found")
+
+    return {
+        "id": record.id,
+        "pipe_id": record.pipe_id,
+        "pipe_code": record.pipe.pipe_code if record.pipe else "",
+        "input_data": record.input_data,
+        "defects": record.defects,
+        "created_at": record.created_at.isoformat(),
+        "report_id": record.report.id if record.report else None,
     }
