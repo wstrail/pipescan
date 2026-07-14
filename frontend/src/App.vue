@@ -1,7 +1,10 @@
 <script setup>
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, onUnmounted, ref } from 'vue'
 
 const API_BASE = import.meta.env.VITE_API_BASE || 'http://localhost:8000'
+const STATUS_POLL_MS = 1000
+let statusTimer = null
+let dbStatsTimer = null
 
 const robot = ref({
   connected: false,
@@ -10,6 +13,15 @@ const robot = ref({
   battery_percent: 0,
   distance_m: 0,
   last_command: 'none',
+  error_code: 0,
+  message: '',
+  temperature_c: null,
+  pitch_deg: null,
+  roll_deg: null,
+  obstacle_detected: false,
+  obstacle_distance_m: null,
+  obstacle_severity: 'none',
+  obstacle_message: '',
   updated_at: ''
 })
 
@@ -24,6 +36,20 @@ const busy = ref(false)
 const error = ref('')
 const reportMarkdown = ref('')
 const evaluation = ref(null)
+const commandSpeed = ref(0.35)
+const importedDefectKeys = ref(new Set())
+const currentInspectionStartedAt = ref(new Date())
+const inspectionStarted = ref(false)
+const autoInspectionActive = ref(false)
+const dismissedObstacleKey = ref('')
+const latestInspectionRecordId = ref(0)
+const inspectionBaselineRecordId = ref(0)
+const dbStats = ref({
+  pipes: 0,
+  inspections: 0,
+  reports: 0,
+  latestPipe: ''
+})
 const telemetry = ref({
   temperature_c: 32.6,
   humidity_percent: 68,
@@ -40,10 +66,7 @@ const inspection = ref({
   diameter_mm: 800,
   region_type: 'traffic',
   soil_type: 'medium',
-  defects: [
-    { category: 'structural', code: 'PL', score: 5, length: 0.8, distance_m: 6.4, description: '管壁破裂' },
-    { category: 'functional', code: 'CJ', score: 2, length: 1.2, distance_m: 12.8, description: '管内沉积' }
-  ]
+  defects: []
 })
 
 const riskText = computed(() => {
@@ -67,6 +90,41 @@ const directionText = computed(() => {
 })
 
 const defectCount = computed(() => inspection.value.defects.length)
+
+const autoDefectCount = computed(() => {
+  return inspection.value.defects.filter((defect) => defect.source === 'auto').length
+})
+
+const obstacleAlert = computed(() => {
+  if (!robot.value.obstacle_detected) return null
+
+  const distance = robot.value.obstacle_distance_m
+  const hasDistance = distance !== null && distance !== undefined
+  const severity = robot.value.obstacle_severity === 'critical' ? 'critical' : 'warning'
+  const title = severity === 'critical' ? '前方严重障碍' : '前方障碍提醒'
+  const message = robot.value.obstacle_message || '检测到前方存在障碍，请控制员减速观察并准备停止。'
+
+  return {
+    severity,
+    title,
+    message,
+    distanceText: hasDistance ? `${Number(distance).toFixed(2)} m` : '未知',
+    key: [severity, hasDistance ? Number(distance).toFixed(1) : 'unknown', message].join('|')
+  }
+})
+
+const activeAlert = computed(() => obstacleAlert.value)
+
+const visibleObstacleAlert = computed(() => {
+  if (!activeAlert.value) return null
+  return activeAlert.value.key === dismissedObstacleKey.value ? null : activeAlert.value
+})
+
+// SIMULATION-ONLY: Highlights data produced by scripts/simulate_robot_sensor.py.
+// Remove this computed label when the backend is connected to a real robot.
+const simulationActive = computed(() => {
+  return dbStats.value.latestPipe.startsWith('SIM-') || String(robot.value.message || '').includes('route=')
+})
 
 const renderedReportHtml = computed(() => renderMarkdown(reportMarkdown.value))
 
@@ -168,11 +226,155 @@ async function request(path, options = {}) {
   return response.json()
 }
 
+function buildDefectKey(record, defect, index) {
+  return [
+    record.id,
+    index,
+    defect.category,
+    defect.code,
+    defect.distance_m,
+    defect.score,
+    defect.description
+  ].join('|')
+}
+
+function importInspectionRecords(records) {
+  if (!autoInspectionActive.value) return
+
+  const orderedRecords = [...records]
+    .filter((record) => {
+      const isSimulationRecord = String(record.pipe_code || '').startsWith('SIM-')
+      return isSimulationRecord && Number(record.id || 0) > inspectionBaselineRecordId.value
+    })
+    .reverse()
+  for (const record of orderedRecords) {
+    const defects = Array.isArray(record.defects) ? record.defects : []
+    defects.forEach((defect, index) => {
+      const key = buildDefectKey(record, defect, index)
+      if (importedDefectKeys.value.has(key)) return
+
+      importedDefectKeys.value.add(key)
+      inspection.value.defects.push({
+        category: defect.category || 'structural',
+        code: defect.code || '',
+        score: Number(defect.score || 0),
+        length: Number(defect.length || 0),
+        distance_m: Number(defect.distance_m || 0),
+        description: defect.description || '',
+        source: 'auto',
+        record_id: record.id,
+        pipe_code: record.pipe_code
+      })
+    })
+  }
+}
+
+function stopAutoInspection() {
+  autoInspectionActive.value = false
+}
+
+function resumeAutoInspection() {
+  if (autoInspectionActive.value) return
+  autoInspectionActive.value = true
+}
+
+function resetInspectionForm() {
+  stopAutoInspection()
+  currentInspectionStartedAt.value = new Date()
+  inspectionStarted.value = false
+  importedDefectKeys.value = new Set()
+  dismissedObstacleKey.value = ''
+  inspectionBaselineRecordId.value = latestInspectionRecordId.value
+  inspection.value = {
+    ...inspection.value,
+    pipe_id: `P-${currentInspectionStartedAt.value.toISOString().slice(0, 10).replaceAll('-', '')}`,
+    defects: []
+  }
+  evaluation.value = null
+  reportMarkdown.value = ''
+}
+
+async function prepareInspection() {
+  resetInspectionForm()
+  commandSpeed.value = 0
+  try {
+    robot.value = await request('/api/robot/reset', { method: 'POST' })
+  } catch (err) {
+    error.value = err.message
+  }
+}
+
+function dismissObstacleAlert() {
+  if (activeAlert.value) {
+    dismissedObstacleKey.value = activeAlert.value.key
+  }
+}
+
+async function startCurrentInspection() {
+  await prepareInspection()
+  inspectionStarted.value = true
+  autoInspectionActive.value = true
+}
+
+function inspectionPayload() {
+  return {
+    ...inspection.value,
+    defects: inspection.value.defects.map((defect) => ({
+      category: defect.category,
+      code: defect.code,
+      score: Number(defect.score || 0),
+      length: Number(defect.length || 0),
+      distance_m: Number(defect.distance_m || 0),
+      description: defect.description || ''
+    }))
+  }
+}
+
 async function loadStatus() {
   try {
     robot.value = await request('/api/robot/status')
     camera.value = await request('/api/camera')
     snapshot.value = await request('/api/camera/snapshot')
+  } catch (err) {
+    error.value = err.message
+  }
+}
+
+async function refreshRobotStatus() {
+  try {
+    robot.value = await request('/api/robot/status')
+    if (robot.value.temperature_c !== null && robot.value.temperature_c !== undefined) {
+      telemetry.value.temperature_c = robot.value.temperature_c
+    }
+    if (robot.value.pitch_deg !== null && robot.value.pitch_deg !== undefined) {
+      telemetry.value.pitch_deg = robot.value.pitch_deg
+    }
+    if (robot.value.roll_deg !== null && robot.value.roll_deg !== undefined) {
+      telemetry.value.roll_deg = robot.value.roll_deg
+    }
+  } catch (err) {
+    error.value = err.message
+  }
+}
+
+async function loadDatabaseStats() {
+  try {
+    const [pipes, inspections, reports] = await Promise.all([
+      request('/api/pipes'),
+      request('/api/inspection/records'),
+      request('/api/inspection/reports')
+    ])
+    dbStats.value = {
+      pipes: pipes.length,
+      inspections: inspections.length,
+      reports: reports.length,
+      latestPipe: inspections[0]?.pipe_code || pipes[0]?.pipe_code || ''
+    }
+    latestInspectionRecordId.value = inspections.reduce((max, record) => Math.max(max, Number(record.id || 0)), latestInspectionRecordId.value)
+    if (!inspectionStarted.value) {
+      inspectionBaselineRecordId.value = latestInspectionRecordId.value
+    }
+    importInspectionRecords(inspections)
   } catch (err) {
     error.value = err.message
   }
@@ -194,12 +396,25 @@ async function sendMotion(action) {
   try {
     robot.value = await request('/api/robot/motion', {
       method: 'POST',
-      body: JSON.stringify({ action, speed: Number(robot.value.speed || 0.35), duration_ms: 300 })
+      body: JSON.stringify({ action, speed: Number(commandSpeed.value || 0.35), duration_ms: 0 })
     })
+    commandSpeed.value = Number(robot.value.speed || 0)
   } catch (err) {
     error.value = err.message
   } finally {
     busy.value = false
+  }
+}
+
+async function syncCommandSpeed() {
+  try {
+    robot.value = await request('/api/robot/motion', {
+      method: 'POST',
+      body: JSON.stringify({ action: 'set_speed', speed: Number(commandSpeed.value || 0), duration_ms: 0 })
+    })
+    commandSpeed.value = Number(robot.value.speed || 0)
+  } catch (err) {
+    error.value = err.message
   }
 }
 
@@ -225,7 +440,8 @@ function addDefect() {
     score: 1,
     length: 0,
     distance_m: Number(robot.value.distance_m || 0),
-    description: ''
+    description: '',
+    source: 'manual'
   })
 }
 
@@ -238,7 +454,7 @@ async function evaluateOnly() {
   try {
     evaluation.value = await request('/api/inspection/evaluate', {
       method: 'POST',
-      body: JSON.stringify(inspection.value)
+      body: JSON.stringify(inspectionPayload())
     })
     reportMarkdown.value = ''
   } catch (err) {
@@ -253,7 +469,7 @@ async function generateReport() {
   try {
     const result = await request('/api/inspection/report', {
       method: 'POST',
-      body: JSON.stringify(inspection.value)
+      body: JSON.stringify(inspectionPayload())
     })
     evaluation.value = result.evaluation
     reportMarkdown.value = result.markdown
@@ -264,7 +480,22 @@ async function generateReport() {
   }
 }
 
-onMounted(loadStatus)
+onMounted(async () => {
+  await prepareInspection()
+  loadDatabaseStats()
+  statusTimer = window.setInterval(refreshRobotStatus, STATUS_POLL_MS)
+  dbStatsTimer = window.setInterval(loadDatabaseStats, STATUS_POLL_MS * 3)
+})
+
+onUnmounted(() => {
+  if (statusTimer) {
+    window.clearInterval(statusTimer)
+  }
+  if (dbStatsTimer) {
+    window.clearInterval(dbStatsTimer)
+  }
+  stopAutoInspection()
+})
 </script>
 
 <template>
@@ -278,6 +509,7 @@ onMounted(loadStatus)
         <span :class="['signal', robot.connected ? 'online' : 'offline']">
           {{ robot.connected ? 'ONLINE' : 'OFFLINE' }}
         </span>
+        <span v-if="simulationActive" class="simulation-badge">模拟传感器模式</span>
         <button class="primary" :disabled="busy" @click="connectRobot">连接机器人</button>
       </div>
     </header>
@@ -324,6 +556,12 @@ onMounted(loadStatus)
               </div>
             </div>
 
+            <div v-if="visibleObstacleAlert" :class="['obstacle-banner', visibleObstacleAlert.severity]">
+              <button class="alert-close" aria-label="关闭障碍提醒" @click="dismissObstacleAlert">×</button>
+              <strong>{{ visibleObstacleAlert.title }}</strong>
+              <span>距离 {{ visibleObstacleAlert.distanceText }} · {{ visibleObstacleAlert.message }}</span>
+            </div>
+
             <div class="hud hud-bottom">
               <div class="exposure-card">当前动作 {{ directionText }}</div>
               <div class="exposure-card distance-card">当前距离 {{ robot.distance_m }} m</div>
@@ -351,9 +589,37 @@ onMounted(loadStatus)
                 <div><span>里程</span><strong>{{ robot.distance_m }}m</strong></div>
                 <div><span>指令</span><strong>{{ robot.last_command }}</strong></div>
               </div>
+              <div v-if="visibleObstacleAlert" :class="['control-alert', visibleObstacleAlert.severity]">
+                <div>
+                  <span>障碍报警</span>
+                  <strong>{{ visibleObstacleAlert.title }}</strong>
+                  <button class="alert-dismiss" @click="dismissObstacleAlert">关闭</button>
+                </div>
+                <p>{{ visibleObstacleAlert.message }}</p>
+                <small>前方距离：{{ visibleObstacleAlert.distanceText }}</small>
+              </div>
+              <div class="database-stats">
+                <div class="database-stats-title">
+                  <span>数据入库</span>
+                  <strong v-if="simulationActive">模拟数据</strong>
+                </div>
+                <div class="database-stats-grid">
+                  <div><span>管段</span><strong>{{ dbStats.pipes }}</strong></div>
+                  <div><span>巡检</span><strong>{{ dbStats.inspections }}</strong></div>
+                  <div><span>报告</span><strong>{{ dbStats.reports }}</strong></div>
+                </div>
+                <small>最新管段：{{ dbStats.latestPipe || '暂无' }}</small>
+              </div>
               <label class="speed-control">
-                速度
-                <input v-model.number="robot.speed" type="range" min="0" max="1" step="0.05" />
+                设定速度 {{ Number(commandSpeed || 0).toFixed(2) }}
+                <input
+                  v-model.number="commandSpeed"
+                  type="range"
+                  min="0"
+                  max="1"
+                  step="0.05"
+                  @change="syncCommandSpeed"
+                />
               </label>
             </div>
             <div class="dpad">
@@ -376,10 +642,18 @@ onMounted(loadStatus)
             <h2>检测数据</h2>
           </div>
           <div class="actions">
+            <button @click="startCurrentInspection">新建巡检</button>
+            <button v-if="inspectionStarted && autoInspectionActive" class="ghost-neutral" @click="stopAutoInspection">停止录入</button>
+            <button v-else-if="inspectionStarted" class="ghost-neutral" @click="resumeAutoInspection">继续录入</button>
             <button @click="addDefect">新增缺陷</button>
             <button @click="evaluateOnly">计算风险</button>
             <button class="primary" @click="generateReport">生成报告</button>
           </div>
+        </div>
+        <div class="inspection-sync">
+          <span>手动录入与自动读入共用此表</span>
+          <strong>{{ autoInspectionActive ? '自动录入中' : '未开始自动录入' }} · 自动缺陷 {{ autoDefectCount }} 条</strong>
+          <small>仅显示本次巡检新增缺陷，历史数据保留在后台</small>
         </div>
 
         <div class="form-grid">
@@ -416,6 +690,7 @@ onMounted(loadStatus)
                 <th>分值</th>
                 <th>长度</th>
                 <th>描述</th>
+                <th>来源</th>
                 <th></th>
               </tr>
             </thead>
@@ -432,6 +707,11 @@ onMounted(loadStatus)
                 <td><input v-model.number="defect.score" type="number" min="0" max="10" /></td>
                 <td><input v-model.number="defect.length" type="number" min="0" /></td>
                 <td><input v-model="defect.description" /></td>
+                <td>
+                  <span :class="['source-pill', defect.source === 'auto' ? 'auto' : 'manual']">
+                    {{ defect.source === 'auto' ? '自动' : '手动' }}
+                  </span>
+                </td>
                 <td><button class="ghost" @click="removeDefect(index)">删除</button></td>
               </tr>
             </tbody>

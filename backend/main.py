@@ -32,6 +32,24 @@ class MotionCommand(BaseModel):
     duration_ms: int = Field(default=0, ge=0, le=60000)
 
 
+class RobotStatusPayload(BaseModel):
+    connected: bool | None = None
+    mode: str | None = None
+    speed: float | None = Field(default=None, ge=0, le=1)
+    battery_percent: int | None = Field(default=None, ge=0, le=100)
+    distance_m: float | None = Field(default=None, ge=0)
+    last_command: str | None = None
+    error_code: int | None = Field(default=None, ge=0)
+    message: str | None = None
+    temperature_c: float | None = None
+    pitch_deg: float | None = None
+    roll_deg: float | None = None
+    obstacle_detected: bool | None = None
+    obstacle_distance_m: float | None = Field(default=None, ge=0)
+    obstacle_severity: Literal["none", "warning", "critical"] | None = None
+    obstacle_message: str | None = None
+
+
 class CameraConfig(BaseModel):
     source: str = "mock://camera-0"
     enabled: bool = True
@@ -74,7 +92,16 @@ class RobotState(BaseModel):
     speed: float = 0.0
     battery_percent: int = 86
     distance_m: float = 0.0
-    last_command: str = "none"
+    last_command: str = "stop"
+    error_code: int = 0
+    message: str = ""
+    temperature_c: float | None = None
+    pitch_deg: float | None = None
+    roll_deg: float | None = None
+    obstacle_detected: bool = False
+    obstacle_distance_m: float | None = None
+    obstacle_severity: Literal["none", "warning", "critical"] = "none"
+    obstacle_message: str = ""
     updated_at: str
 
 
@@ -87,22 +114,74 @@ class MotionController:
 
     def __init__(self) -> None:
         self.state = RobotState(updated_at=datetime.now().isoformat(timespec="seconds"))
+        self.last_motion_at = datetime.now()
+        self.last_external_status_at: datetime | None = None
+
+    def reset(self) -> RobotState:
+        self.state = RobotState(
+            connected=True,
+            mode="ready",
+            speed=0.0,
+            distance_m=0.0,
+            last_command="stop",
+            updated_at=datetime.now().isoformat(timespec="seconds"),
+        )
+        self.last_motion_at = datetime.now()
+        self.last_external_status_at = None
+        return self.state
+
+    def _advance_motion(self) -> None:
+        now = datetime.now()
+        has_recent_external_status = (
+            self.last_external_status_at is not None
+            and (now - self.last_external_status_at).total_seconds() < 2.0
+        )
+        if has_recent_external_status:
+            self.last_motion_at = now
+            return
+
+        elapsed = max(0.0, (now - self.last_motion_at).total_seconds())
+        if self.state.last_command == "forward":
+            self.state.distance_m = round(self.state.distance_m + self.state.speed * elapsed, 2)
+        elif self.state.last_command == "backward":
+            self.state.distance_m = max(0.0, round(self.state.distance_m - self.state.speed * elapsed, 2))
+        self.last_motion_at = now
+
+    def current_state(self) -> RobotState:
+        self._advance_motion()
+        self.state.updated_at = datetime.now().isoformat(timespec="seconds")
+        return self.state
 
     def connect(self) -> RobotState:
+        self._advance_motion()
         self.state.connected = True
         self.state.mode = "ready"
         self.state.updated_at = datetime.now().isoformat(timespec="seconds")
         return self.state
 
     def send_command(self, command: MotionCommand) -> RobotState:
+        self._advance_motion()
         self.state.connected = True
+        if command.action == "set_speed":
+            self.state.speed = command.speed
+            self.state.mode = "manual" if self.state.last_command in {"forward", "backward", "left", "right"} else self.state.mode
+            self.state.updated_at = datetime.now().isoformat(timespec="seconds")
+            return self.state
+
         self.state.last_command = command.action
         self.state.speed = 0 if command.action == "stop" else command.speed
         self.state.mode = "stopped" if command.action == "stop" else "manual"
-        if command.action == "forward":
-            self.state.distance_m = round(self.state.distance_m + max(command.speed, 0.1) * 0.2, 2)
-        if command.action == "backward":
-            self.state.distance_m = max(0.0, round(self.state.distance_m - max(command.speed, 0.1) * 0.2, 2))
+        self.state.updated_at = datetime.now().isoformat(timespec="seconds")
+        return self.state
+
+    def update_status(self, payload: RobotStatusPayload) -> RobotState:
+        data = payload.model_dump(exclude_unset=True)
+        for key, value in data.items():
+            if value is not None:
+                setattr(self.state, key, value)
+        self.state.connected = data.get("connected", True)
+        self.last_motion_at = datetime.now()
+        self.last_external_status_at = self.last_motion_at
         self.state.updated_at = datetime.now().isoformat(timespec="seconds")
         return self.state
 
@@ -166,9 +245,19 @@ def connect_robot() -> RobotState:
     return motion.connect()
 
 
+@app.post("/api/robot/reset", response_model=RobotState)
+def reset_robot() -> RobotState:
+    return motion.reset()
+
+
 @app.get("/api/robot/status", response_model=RobotState)
 def robot_status() -> RobotState:
-    return motion.state
+    return motion.current_state()
+
+
+@app.post("/api/robot/status", response_model=RobotState)
+def update_robot_status(status: RobotStatusPayload) -> RobotState:
+    return motion.update_status(status)
 
 
 @app.post("/api/robot/motion", response_model=RobotState)
